@@ -1,216 +1,336 @@
-import streamlit as st
-
+from profile import save_results
+from utils import normalize_image
 import numpy as np
+from photutils.aperture import CircularAperture, aperture_photometry
+from photutils.centroids import centroid_com
+from scipy.ndimage import gaussian_filter
+
+
+def find_galaxy_center(image):
+    """
+    은하 중심 자동 검출
+    """
+    smooth = gaussian_filter(image, sigma=3)
+
+    y, x = centroid_com(smooth)
+
+    return x, y
+
+
+def radial_surface_brightness(image, center, max_radius=None):
+    """
+    Surface Brightness Profile 계산
+    """
+
+    y0, x0 = center
+
+    if max_radius is None:
+        max_radius = int(min(image.shape) / 2)
+
+    radii = []
+    brightness = []
+
+    previous_flux = 0
+
+    for r in range(2, max_radius):
+
+        aperture = CircularAperture((x0, y0), r=r)
+
+        phot_table = aperture_photometry(image, aperture)
+
+        total_flux = phot_table['aperture_sum'][0]
+
+        annulus_area = np.pi * (r**2 - (r-1)**2)
+
+        annulus_flux = total_flux - previous_flux
+
+        previous_flux = total_flux
+
+        surface = annulus_flux / annulus_area
+
+        radii.append(r)
+
+        brightness.append(surface)
+
+    return np.array(radii), np.array(brightness)
+
+
+def cumulative_flux(image, center, max_radius=None):
+    """
+    반지름별 누적 Flux 계산
+    """
+
+    y0, x0 = center
+
+    if max_radius is None:
+        max_radius = int(min(image.shape)/2)
+
+    radii = []
+    flux = []
+
+    for r in range(2, max_radius):
+
+        aperture = CircularAperture((x0, y0), r=r)
+
+        phot_table = aperture_photometry(image, aperture)
+
+        radii.append(r)
+
+        flux.append(phot_table['aperture_sum'][0])
+
+    return np.array(radii), np.array(flux)
+
+
+def effective_radius(image, center):
+    """
+    Half-light Radius 계산
+    """
+
+    radii, flux = cumulative_flux(image, center)
+
+    total = flux[-1]
+
+    half = total / 2
+
+    idx = np.argmin(np.abs(flux-half))
+
+    return radii[idx], total
+    import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
 
 from astropy.io import fits
 
-from PIL import Image
-
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz
-
-from astropy.time import Time
-
-from datetime import datetime
-
-
-# --- Streamlit 앱 페이지 설정 ---
-
-st.set_page_config(page_title="천문 이미지 분석기", layout="wide")
-
-st.title("🔭 천문 이미지 처리 앱")
-
-
-# --- 파일 업로더 ---
-
-uploaded_file = st.file_uploader(
-
-    "분석할 FITS 파일을 선택하세요.",
-
-    type=['fits', 'fit', 'fz']
-
+from photometry import (
+    find_galaxy_center,
+    radial_surface_brightness,
+    effective_radius,
 )
 
+st.set_page_config(
+    page_title="Galaxy Structure Analyzer",
+    layout="wide"
+)
 
-# --- 서울 위치 설정 (고정값) ---
+st.title("🌌 Galaxy Structure Analyzer")
+st.write(
+    "Analyze Surface Brightness Profile and Effective Radius from FITS images."
+)
 
-seoul_location = EarthLocation(lat=37.5665, lon=126.9780, height=50)  # 서울 위도/경도/고도
+uploaded_file = st.file_uploader(
+    "Upload FITS Image",
+    type=["fits", "fit"]
+)
 
+if uploaded_file is not None:
 
-# --- 현재 시간 (UTC 기준) ---
+    hdul = fits.open(uploaded_file)
 
-now = datetime.utcnow()
+    image = hdul[0].data.astype(float)
 
-now_astropy = Time(now)
+    hdul.close()
 
+    if image.ndim > 2:
+        image = image[0]
 
-# --- 파일이 업로드되면 실행될 로직 ---
+    st.subheader("Original FITS Image")
 
-if uploaded_file:
+    fig, ax = plt.subplots(figsize=(6,6))
 
-    try:
+    ax.imshow(
+        image,
+        origin="lower",
+        cmap="gray",
+        vmin=np.percentile(image,5),
+        vmax=np.percentile(image,99)
+    )
 
-        with fits.open(uploaded_file) as hdul:
+    st.pyplot(fig)
 
-            image_hdu = None
+    st.write("---")
 
-            for hdu in hdul:
+    st.subheader("Finding Galaxy Center...")
 
-                if hdu.data is not None and hdu.is_image:
+    center_x, center_y = find_galaxy_center(image)
 
-                    image_hdu = hdu
+    st.success(
+        f"Galaxy Center : ({center_x:.2f}, {center_y:.2f})"
+    )
 
-                    break
+    fig2, ax2 = plt.subplots(figsize=(6,6))
 
+    ax2.imshow(
+        image,
+        origin="lower",
+        cmap="gray",
+        vmin=np.percentile(image,5),
+        vmax=np.percentile(image,99)
+    )
 
-            if image_hdu is None:
+    ax2.scatter(
+        center_x,
+        center_y,
+        color="red",
+        s=80,
+        label="Center"
+    )
 
-                st.error("파일에서 유효한 이미지 데이터를 찾을 수 없습니다.")
+    ax2.legend()
 
-            else:
+    st.pyplot(fig2)
 
-                header = image_hdu.header
+    st.write("---")
 
-                data = image_hdu.data
+    st.subheader("Surface Brightness Profile")
 
-                data = np.nan_to_num(data)
+    radii, brightness = radial_surface_brightness(
+        image,
+        (center_y, center_x)
+    )
 
+    fig3, ax3 = plt.subplots(figsize=(7,5))
 
-                st.success(f"**'{uploaded_file.name}'** 파일을 성공적으로 처리했습니다.")
+    ax3.plot(
+        radii,
+        brightness,
+        color="blue",
+        linewidth=2
+    )
 
-                col1, col2 = st.columns(2)
+    ax3.set_xlabel("Radius (pixels)")
+    ax3.set_ylabel("Surface Brightness")
+    ax3.grid(True)
 
+    st.pyplot(fig3)
 
-                with col1:
+    st.write("---")
 
-                    st.header("이미지 정보")
+    st.subheader("Effective Radius")
 
-                    st.text(f"크기: {data.shape[1]} x {data.shape[0]} 픽셀")
+    re, total_flux = effective_radius(
+        image,
+        (center_y, center_x)
+    )
 
-                    if 'OBJECT' in header:
+    st.metric(
+        "Effective Radius",
+        f"{re:.2f} pixels"
+    )
 
-                        st.text(f"관측 대상: {header['OBJECT']}")
+    st.metric(
+        "Total Flux",
+        f"{total_flux:.2f}"
+    )
 
-                    if 'EXPTIME' in header:
+    st.write("---")
 
-                        st.text(f"노출 시간: {header['EXPTIME']} 초")
+    st.subheader("Effective Radius Overlay")
 
+    fig4, ax4 = plt.subplots(figsize=(6,6))
 
-                    st.header("물리량")
+    ax4.imshow(
+        image,
+        origin="lower",
+        cmap="gray",
+        vmin=np.percentile(image,5),
+        vmax=np.percentile(image,99)
+    )
 
-                    mean_brightness = np.mean(data)
+    circle = plt.Circle(
+        (center_x, center_y),
+        re,
+        color="red",
+        fill=False,
+        linewidth=2
+    )
 
-                    st.metric(label="이미지 전체 평균 밝기", value=f"{mean_brightness:.2f}")
+    ax4.add_patch(circle)
 
+    ax4.scatter(
+        center_x,
+        center_y,
+        color="yellow",
+        s=60
+    )
 
-                with col2:
+    st.pyplot(fig4)
 
-                    st.header("이미지 미리보기")
+st.sidebar.title("About")
 
-                    if data.max() == data.min():
+st.sidebar.info(
+"""
+Galaxy Structure Analyzer
 
-                        norm_data = np.zeros(data.shape, dtype=np.uint8)
+Functions
 
-                    else:
+• FITS Upload
 
-                        scale_min = np.percentile(data, 5)
+• Galaxy Center Detection
 
-                        scale_max = np.percentile(data, 99.5)
+• Surface Brightness Profile
 
-                        data_clipped = np.clip(data, scale_min, scale_max)
+• Effective Radius
 
-                        norm_data = (255 * (data_clipped - scale_min) / (scale_max - scale_min)).astype(np.uint8)
+Created with
 
+Python
 
-                    img = Image.fromarray(norm_data)
+Streamlit
 
-                    st.image(img, caption="업로드된 FITS 이미지", use_container_width=True)
+Astropy
 
+Photutils
+"""
+)
+import numpy as np
+import pandas as pd
 
 
-                # --- 사이드바: 현재 천체 위치 계산 ---
+def save_results(radius, brightness, filename="surface_profile.csv"):
+    df = pd.DataFrame({
+        "Radius (pixel)": radius,
+        "Surface Brightness": brightness
+    })
 
-                st.sidebar.header("🧭 현재 천체 위치 (서울 기준)")
+    df.to_csv(filename, index=False)
 
+    return filename
 
-                if 'RA' in header and 'DEC' in header:
 
-                    try:
+def galaxy_summary(center_x, center_y, effective_radius, total_flux):
 
-                        target_coord = SkyCoord(ra=header['RA'], dec=header['DEC'], unit=('hourangle', 'deg'))
+    result = {
+        "Center X": center_x,
+        "Center Y": center_y,
+        "Effective Radius": effective_radius,
+        "Total Flux": total_flux
+    }
 
-                        altaz = target_coord.transform_to(AltAz(obstime=now_astropy, location=seoul_location))
+    return result
+    import numpy as np
+from astropy.visualization import ZScaleInterval
 
-                        altitude = altaz.alt.degree
 
-                        azimuth = altaz.az.degree
+def normalize_image(image):
 
+    image = np.nan_to_num(image)
 
-                        st.sidebar.metric("고도 (°)", f"{altitude:.2f}")
+    interval = ZScaleInterval()
 
-                        st.sidebar.metric("방위각 (°)", f"{azimuth:.2f}")
+    vmin, vmax = interval.get_limits(image)
 
-                    except Exception as e:
+    return image, vmin, vmax
 
-                        st.sidebar.warning(f"천체 위치 계산 실패: {e}")
 
-                else:
+def image_statistics(image):
 
-                    st.sidebar.info("FITS 헤더에 RA/DEC 정보가 없습니다.")
+    return {
+        "Mean": np.mean(image),
+        "Median": np.median(image),
+        "Maximum": np.max(image),
+        "Minimum": np.min(image),
+        "Std": np.std(image)
+    }
 
+     
 
-    except Exception as e:
-
-        st.error(f"파일 처리 중 오류가 발생했습니다: {e}")
-
-        st.warning("파일이 손상되었거나 유효한 FITS 형식이 아닐 수 있습니다.")
-
-else:
-
-    st.info("시작하려면 FITS 파일을 업로드해주세요.")
-
-
-# --- 💬 댓글 기능 (세션 기반) ---
-
-st.divider()
-
-st.header("💬 의견 남기기")
-
-
-if "comments" not in st.session_state:
-
-    st.session_state.comments = []
-
-
-with st.form(key="comment_form"):
-
-    name = st.text_input("이름을 입력하세요", key="name_input")
-
-    comment = st.text_area("댓글을 입력하세요", key="comment_input")
-
-    submitted = st.form_submit_button("댓글 남기기")
-
-
-    if submitted:
-
-        if name.strip() and comment.strip():
-
-            st.session_state.comments.append((name.strip(), comment.strip()))
-
-            st.success("댓글이 저장되었습니다.")
-
-        else:
-
-            st.warning("이름과 댓글을 모두 입력해주세요.")
-
-
-if st.session_state.comments:
-
-    st.subheader("📋 전체 댓글")
-
-    for i, (n, c) in enumerate(reversed(st.session_state.comments), 1):
-
-        st.markdown(f"**{i}. {n}**: {c}")
-
-else:
-
-    st.info("아직 댓글이 없습니다. 첫 댓글을 남겨보세요!")
